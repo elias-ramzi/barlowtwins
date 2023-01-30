@@ -9,22 +9,51 @@ import argparse
 import json
 import math
 import os
-import random
 import signal
+import socket
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 
-from PIL import Image, ImageOps, ImageFilter
-from torch import nn, optim
+from torch import nn
 import torch
 import torchvision
-import torchvision.transforms as transforms
+
+from inat import iNatDataset
+from sop import SOPDataset
+from cub200 import Cub200Dataset
+from lars import LARS
+from transform import Transform, RandAugment, EasyTransform
+
+
+DATASETS = [
+    'imagenet',
+    'sop',
+    'inat',
+    'cub200',
+]
+
+BACKBONES = [
+    'resnet18',
+    'resnet50',
+]
+
+TRANSFORMS = [
+    'easy',
+    'base',
+    'randaugment',
+]
 
 parser = argparse.ArgumentParser(description='Barlow Twins Training')
 parser.add_argument('data', type=Path, metavar='DIR',
                     help='path to dataset')
-parser.add_argument('--workers', default=8, type=int, metavar='N',
+parser.add_argument('--dataset', type=str, default='sop', choices=DATASETS, help='Training dataset')
+parser.add_argument('--backbone', type=str, default='resnet50', choices=BACKBONES, help='Neural network')
+parser.add_argument('--pretrained', action='store_true', default=False, help='Run in distributed')
+parser.add_argument('--freeze_bn', action='store_true', default=False, help='Run in distributed')
+parser.add_argument('--transform', type=str, default='base', choices=TRANSFORMS, help='Set of transform')
+parser.add_argument('--workers', default=10, type=int, metavar='N',
                     help='number of data loader workers')
 parser.add_argument('--epochs', default=1000, type=int, metavar='N',
                     help='number of total epochs to run')
@@ -56,18 +85,61 @@ def main():
         signal.signal(signal.SIGTERM, handle_sigterm)
         # find a common host name on all nodes
         # assume scontrol returns hosts in the same order on all nodes
-        cmd = 'scontrol show hostnames ' + os.getenv('SLURM_JOB_NODELIST')
-        stdout = subprocess.check_output(cmd.split())
-        host_name = stdout.decode().splitlines()[0]
-        args.rank = int(os.getenv('SLURM_NODEID')) * args.ngpus_per_node
-        args.world_size = int(os.getenv('SLURM_NNODES')) * args.ngpus_per_node
-        args.dist_url = f'tcp://{host_name}:58472'
+        n_nodes = int(os.environ['SLURM_JOB_NUM_NODES'])
+        node_id = int(os.environ['SLURM_NODEID'])
+
+        # local rank on the current node / global rank
+        local_rank = int(os.environ['SLURM_LOCALID'])
+        global_rank = int(os.environ['SLURM_PROCID'])
+
+        # number of processes / GPUs per node
+        world_size = int(os.environ['SLURM_NTASKS'])
+        n_gpu_per_node = world_size // n_nodes
+
+        # define master address and master port
+        hostnames = subprocess.check_output(['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']])
+        master_addr = hostnames.split()[0].decode('utf-8')
+
+        # set environment variables for 'env://'
+        os.environ['MASTER_ADDR'] = master_addr
+        os.environ['MASTER_PORT'] = str(29500)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['RANK'] = str(global_rank)
+
+        # define whether this is the master process / if we are in distributed mode
+        is_master = node_id == 0 and local_rank == 0
+        multi_node = n_nodes > 1
+        multi_gpu = world_size > 1
+
+        if is_master:
+            PREFIX = "%i - " % global_rank
+            print(PREFIX + "Number of nodes: %i" % n_nodes)
+            print(PREFIX + "Node ID        : %i" % node_id)
+            print(PREFIX + "Local rank     : %i" % local_rank)
+            print(PREFIX + "Global rank    : %i" % global_rank)
+            print(PREFIX + "World size     : %i" % world_size)
+            print(PREFIX + "GPUs per node  : %i" % n_gpu_per_node)
+            print(PREFIX + "Master         : %s" % str(is_master))
+            print(PREFIX + "Multi-node     : %s" % str(multi_node))
+            print(PREFIX + "Multi-GPU      : %s" % str(multi_gpu))
+            print(PREFIX + "Hostname       : %s" % socket.gethostname())
+
+        args.rank = int(os.getenv('SLURM_NODEID')) * n_gpu_per_node
+        args.world_size = int(os.environ['SLURM_NTASKS'])
+        args.dist_url = 'env://'
+
+        main_worker(local_rank, args)
+
     else:
         # single-node distributed training
+        # import socket
+        # sock = socket.socket()
+        # sock.bind(('', 0))
+        # sock.getsockname()[1]
         args.rank = 0
-        args.dist_url = 'tcp://localhost:58472'
+        args.dist_url = 'tcp://localhost:58471'
         args.world_size = args.ngpus_per_node
-    torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
+        torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
 
 
 def main_worker(gpu, args):
@@ -77,6 +149,7 @@ def main_worker(gpu, args):
         world_size=args.world_size, rank=args.rank)
 
     if args.rank == 0:
+        args.checkpoint_dir = Path(os.path.expandvars(os.path.expanduser(args.checkpoint_dir)))
         args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         stats_file = open(args.checkpoint_dir / 'stats.txt', 'a', buffering=1)
         print(' '.join(sys.argv))
@@ -87,42 +160,68 @@ def main_worker(gpu, args):
 
     model = BarlowTwins(args).cuda(gpu)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    param_weights = []
-    param_biases = []
-    for param in model.parameters():
+    param_backbone_weights = []
+    param_backbone_biases = []
+    param_projector_weights = []
+    param_projector_biases = []
+    for param in model.backbone.parameters():
         if param.ndim == 1:
-            param_biases.append(param)
+            param_backbone_biases.append(param)
         else:
-            param_weights.append(param)
-    parameters = [{'params': param_weights}, {'params': param_biases}]
+            param_backbone_weights.append(param)
+    for param in model.projector.parameters():
+        if param.ndim == 1:
+            param_projector_biases.append(param)
+        else:
+            param_projector_weights.append(param)
+    parameters = [{'params': param_backbone_weights}, {'params': param_backbone_biases}, {'params': param_projector_weights}, {'params': param_projector_biases}]
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
     optimizer = LARS(parameters, lr=0, weight_decay=args.weight_decay,
                      weight_decay_filter=True,
                      lars_adaptation_filter=True)
+    scaler = torch.cuda.amp.GradScaler()
 
     # automatically resume from checkpoint if it exists
     if (args.checkpoint_dir / 'checkpoint.pth').is_file():
-        ckpt = torch.load(args.checkpoint_dir / 'checkpoint.pth',
-                          map_location='cpu')
+        ckpt = torch.load(args.checkpoint_dir / 'checkpoint.pth', map_location='cpu')
         start_epoch = ckpt['epoch']
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
+        scaler.load_state_dict(ckpt['scaler'])
     else:
         start_epoch = 0
 
-    dataset = torchvision.datasets.ImageFolder(args.data / 'train', Transform())
+    if args.transform == 'base':
+        transform_fn = Transform()
+    elif args.transform == 'easy':
+        transform_fn = EasyTransform()
+    elif args.transform == 'randaugment':
+        transform_fn = RandAugment()
+
+    if args.dataset == 'imagenet':
+        dataset = torchvision.datasets.ImageFolder(args.data / 'train', transform_fn)
+    elif args.dataset == 'sop':
+        dataset = SOPDataset(args.data, transform=transform_fn)
+    elif args.dataset == 'inat':
+        dataset = iNatDataset(args.data, transform=transform_fn)
+    elif args.dataset == 'cub200':
+        dataset = Cub200Dataset(args.data, transform=transform_fn)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     assert args.batch_size % args.world_size == 0
     per_device_batch_size = args.batch_size // args.world_size
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=per_device_batch_size, num_workers=args.workers,
-        pin_memory=True, sampler=sampler)
+        dataset,
+        batch_size=per_device_batch_size,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=sampler,
+        persistent_workers=True,
+    )
 
     start_time = time.time()
-    scaler = torch.cuda.amp.GradScaler()
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
-        for step, ((y1, y2), _) in enumerate(loader, start=epoch * len(loader)):
+        for step, ((y1, y2), *_) in enumerate(loader, start=epoch * len(loader)):
             y1 = y1.cuda(gpu, non_blocking=True)
             y2 = y2.cuda(gpu, non_blocking=True)
             adjust_learning_rate(args, optimizer, loader, step)
@@ -144,12 +243,17 @@ def main_worker(gpu, args):
         if args.rank == 0:
             # save checkpoint
             state = dict(epoch=epoch + 1, model=model.state_dict(),
-                         optimizer=optimizer.state_dict())
+                         optimizer=optimizer.state_dict(), scaler=scaler.state_dict(), args=args)
             torch.save(state, args.checkpoint_dir / 'checkpoint.pth')
+            if (epoch+1) % 1 == 0:
+                state = dict(epoch=epoch + 1, model=model.state_dict(), args=args,
+                             optimizer=optimizer.state_dict(), scaler=scaler.state_dict(), backbone=model.module.backbone.state_dict())
+                torch.save(state, args.checkpoint_dir / f'checkpoint_{epoch}.pth')
     if args.rank == 0:
         # save final model
-        torch.save(model.module.backbone.state_dict(),
-                   args.checkpoint_dir / 'resnet50.pth')
+        state = dict(epoch=epoch + 1, model=model.state_dict(), args=args,
+                     optimizer=optimizer.state_dict(), scaler=scaler.state_dict(), backbone=model.module.backbone.state_dict())
+        torch.save(state, args.checkpoint_dir / 'resnet50.pth')
 
 
 def adjust_learning_rate(args, optimizer, loader, step):
@@ -164,8 +268,10 @@ def adjust_learning_rate(args, optimizer, loader, step):
         q = 0.5 * (1 + math.cos(math.pi * step / max_steps))
         end_lr = base_lr * 0.001
         lr = base_lr * q + end_lr * (1 - q)
-    optimizer.param_groups[0]['lr'] = lr * args.learning_rate_weights
-    optimizer.param_groups[1]['lr'] = lr * args.learning_rate_biases
+    optimizer.param_groups[0]['lr'] = lr * args.learning_rate_weights #* int(step >= warmup_steps)
+    optimizer.param_groups[1]['lr'] = lr * args.learning_rate_biases #* int(step >= warmup_steps)
+    optimizer.param_groups[2]['lr'] = lr * args.learning_rate_weights #* 5
+    optimizer.param_groups[3]['lr'] = lr * args.learning_rate_biases #* 5
 
 
 def handle_sigusr1(signum, frame):
@@ -184,15 +290,31 @@ def off_diagonal(x):
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
+def adapt_checkpoint(state_dict: OrderedDict, remove: str = 'module.', replace: str = '') -> OrderedDict:
+    """
+    This function renames keys in a state_dict.
+    The default function is helpfull when a NN has been used with parallelism.
+    """
+    new_dict = OrderedDict()
+    for key, weight in state_dict.items():
+        new_key = key.replace(remove, replace)
+        new_dict[new_key] = weight
+    return new_dict
+
+
 class BarlowTwins(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.backbone = torchvision.models.resnet50(zero_init_residual=True)
+        if args.backbone == 'resnet18':
+            self.backbone = torchvision.models.resnet18(zero_init_residual=True, pretrained=args.pretrained)
+        elif args.backbone == 'resnet50':
+            self.backbone = torchvision.models.resnet50(zero_init_residual=True, pretrained=args.pretrained)
+        num_features = self.backbone.fc.weight.size(1)
         self.backbone.fc = nn.Identity()
 
         # projector
-        sizes = [2048] + list(map(int, args.projector.split('-')))
+        sizes = [num_features] + list(map(int, args.projector.split('-')))
         layers = []
         for i in range(len(sizes) - 2):
             layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=False))
@@ -204,7 +326,14 @@ class BarlowTwins(nn.Module):
         # normalization layer for the representations z1 and z2
         self.bn = nn.BatchNorm1d(sizes[-1], affine=False)
 
+        if args.pretrained and (args.backbone == 'resnet50'):
+            barlow_state = torch.load('barlow_state.pth', map_location='cpu')
+            self.load_state_dict(adapt_checkpoint(barlow_state['model']))
+
     def forward(self, y1, y2):
+        if self.args.freeze_bn:
+            self.backbone.eval()
+
         z1 = self.projector(self.backbone(y1))
         z2 = self.projector(self.backbone(y2))
 
@@ -219,111 +348,6 @@ class BarlowTwins(nn.Module):
         off_diag = off_diagonal(c).pow_(2).sum()
         loss = on_diag + self.args.lambd * off_diag
         return loss
-
-
-class LARS(optim.Optimizer):
-    def __init__(self, params, lr, weight_decay=0, momentum=0.9, eta=0.001,
-                 weight_decay_filter=False, lars_adaptation_filter=False):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum,
-                        eta=eta, weight_decay_filter=weight_decay_filter,
-                        lars_adaptation_filter=lars_adaptation_filter)
-        super().__init__(params, defaults)
-
-
-    def exclude_bias_and_norm(self, p):
-        return p.ndim == 1
-
-    @torch.no_grad()
-    def step(self):
-        for g in self.param_groups:
-            for p in g['params']:
-                dp = p.grad
-
-                if dp is None:
-                    continue
-
-                if not g['weight_decay_filter'] or not self.exclude_bias_and_norm(p):
-                    dp = dp.add(p, alpha=g['weight_decay'])
-
-                if not g['lars_adaptation_filter'] or not self.exclude_bias_and_norm(p):
-                    param_norm = torch.norm(p)
-                    update_norm = torch.norm(dp)
-                    one = torch.ones_like(param_norm)
-                    q = torch.where(param_norm > 0.,
-                                    torch.where(update_norm > 0,
-                                                (g['eta'] * param_norm / update_norm), one), one)
-                    dp = dp.mul(q)
-
-                param_state = self.state[p]
-                if 'mu' not in param_state:
-                    param_state['mu'] = torch.zeros_like(p)
-                mu = param_state['mu']
-                mu.mul_(g['momentum']).add_(dp)
-
-                p.add_(mu, alpha=-g['lr'])
-
-
-
-class GaussianBlur(object):
-    def __init__(self, p):
-        self.p = p
-
-    def __call__(self, img):
-        if random.random() < self.p:
-            sigma = random.random() * 1.9 + 0.1
-            return img.filter(ImageFilter.GaussianBlur(sigma))
-        else:
-            return img
-
-
-class Solarization(object):
-    def __init__(self, p):
-        self.p = p
-
-    def __call__(self, img):
-        if random.random() < self.p:
-            return ImageOps.solarize(img)
-        else:
-            return img
-
-
-class Transform:
-    def __init__(self):
-        self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=Image.BICUBIC),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply(
-                [transforms.ColorJitter(brightness=0.4, contrast=0.4,
-                                        saturation=0.2, hue=0.1)],
-                p=0.8
-            ),
-            transforms.RandomGrayscale(p=0.2),
-            GaussianBlur(p=1.0),
-            Solarization(p=0.0),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-        self.transform_prime = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=Image.BICUBIC),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply(
-                [transforms.ColorJitter(brightness=0.4, contrast=0.4,
-                                        saturation=0.2, hue=0.1)],
-                p=0.8
-            ),
-            transforms.RandomGrayscale(p=0.2),
-            GaussianBlur(p=0.1),
-            Solarization(p=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-
-    def __call__(self, x):
-        y1 = self.transform(x)
-        y2 = self.transform_prime(x)
-        return y1, y2
 
 
 if __name__ == '__main__':
